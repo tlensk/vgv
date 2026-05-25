@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<!-- Tatiana Lenskaia Copyright 2026 All rights reserved. E-mail: t.lenskaia@icloud.com-->
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Simple Phage Genome Viewer</title>
+
+<!-- D3.js for scaling genome -->
+<script src="https://d3js.org/d3.v7.min.js"></script>
+
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        margin: 20px;
+        background: #f5f5f5;
+    }
+
+    h1 {
+        margin-bottom: 10px;
+    }
+
+    #viewer {
+        border: 1px solid #ccc;
+        background: white;
+        overflow: hidden;
+        border-radius: 10px;
+    }
+
+    .gene-forward {
+        fill: #4f46e5;
+    }
+
+    .gene-reverse {
+        fill: #10b981;
+    }
+
+    .gene-label {
+        font-size: 10px;
+        pointer-events: none;
+    }
+
+    .axis {
+        stroke: #222;
+        stroke-width: 2;
+    }
+
+    .tooltip {
+        position: absolute;
+        background: rgba(0,0,0,0.8);
+        color: white;
+        padding: 6px 10px;
+        border-radius: 5px;
+        font-size: 12px;
+        pointer-events: none;
+        opacity: 0;
+    }
+
+    .domain {
+        stroke: #222;
+        stroke-width: 2;
+    }
+
+    .tick line {
+        stroke: #888;
+    }
+
+    .tick text {
+        font-size: 11px;
+        fill: #333;
+    }
+</style>
+</head>
+
+<body>
+
+<h1>Simple Phage Genome Viewer</h1>
+
+<p>
+Upload a GenBank (.gb/.gbk) file to visualize genes on forward (above the centerline, in lavender) and reverse strands (below the centerline, in mint).<br>
+Use mouse wheel to zoom and drag to pan. Press "Flip Genome" button at the bottom to rotate the genome view (all gene coordinates match the GenBank annotation).<br>
+</p>
+
+<input type="file" id="fileInput">
+
+<div id="viewer"></div>
+<button id="flipBtn">Flip Genome</button>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+
+const width = 2000;
+const height = 400;
+const axisY = 200;
+
+const svg = d3.select("#viewer")
+    .append("svg")
+    .attr("width", width)
+    .attr("height", height);
+
+
+
+const container = svg.append("g");
+
+const axisGroup = container.append("g")
+    .attr("transform", `translate(0, ${axisY})`);
+
+
+const tooltip = d3.select("#tooltip");
+
+let genomeLength = 10000;
+let flipped = false;
+let lastData = null;
+let flippedAxis = false;
+
+const xScale = d3.scaleLinear()
+    .domain([0, genomeLength])
+    .range([50, width - 50]);
+
+
+
+const zoom = d3.zoom()
+    .scaleExtent([1, 100])
+    .translateExtent([[0, 0], [width, height]])
+    .on("zoom", zoomed);
+
+svg.call(zoom);
+
+function zoomed(event) {
+    container.attr("transform", event.transform);
+}
+
+function parseGenBank(text) {
+
+    const lines = text.split(/\r?\n/);
+
+    let features = [];
+    let sequence = "";
+    let inOrigin = false;
+    let currentFeature = null;
+
+    for (let line of lines) {
+
+        if (line.startsWith("ORIGIN")) {
+            inOrigin = true;
+            continue;
+        }
+
+        if (inOrigin) {
+            if (line.startsWith("//")) break;
+            sequence += line.replace(/[^atgcATGC]/g, "");
+        }
+
+        if (line.startsWith("     CDS")) {
+
+            if (currentFeature) features.push(currentFeature);
+
+            currentFeature = {
+                type: "CDS",
+                strand: "+",
+                start: 0,
+                end: 0,
+                label: "CDS"
+            };
+
+            const complement = line.includes("complement");
+
+            const match = line.match(/(\d+)\.\.(\d+)/);
+
+            if (match) {
+                currentFeature.start = parseInt(match[1]);
+                currentFeature.end = parseInt(match[2]);
+            }
+
+            if (complement) {
+                currentFeature.strand = "-";
+            }
+        }
+
+        if (currentFeature && line.includes("/gene=")) {
+            const gene = line.match(/\/gene=\"([^\"]+)\"/);
+            if (gene) currentFeature.label = gene[1];
+        }
+
+        if (currentFeature && line.includes("/product=")) {
+            const product = line.match(/\/product=\"([^\"]+)\"/);
+            if (product && currentFeature.label === "CDS") {
+                currentFeature.label = product[1];
+            }
+        }
+    }
+
+    if (currentFeature) features.push(currentFeature);
+
+    genomeLength = sequence.length;
+
+    return {
+        genomeLength,
+        features
+    };
+}
+
+function flipCoord(start, end, length) {
+    return {
+        start: length - end,
+        end: length - start
+    };
+}
+
+
+
+
+function drawGenome(data) {
+
+    container.selectAll(".gene").remove();
+    container.selectAll(".gene-label").remove();
+
+
+    axisGroup.selectAll("*").remove();
+    
+    xScale.domain([0, data.genomeLength]);
+
+    const axisScale = flipped
+        ? xScale.copy().range([width - 50, 50])
+        : xScale;  
+
+    
+    const axis = d3.axisBottom(axisScale)
+        .ticks(10)
+        .tickFormat(d => `${Math.round(d/1000)} Kbp`);
+
+
+
+    axisGroup.call(axis);
+
+    // -----------------------------
+    // Split strands
+    // -----------------------------
+    const forwardGenes = data.features.filter(g => g.strand === "+");
+    const reverseGenes = data.features.filter(g => g.strand === "-");
+
+    // -----------------------------
+    // Assign overlapping tracks
+    // -----------------------------
+    function assignTracks(genes) {
+
+        // Sort by start coordinate
+        genes.sort((a, b) => a.start - b.start);
+
+        const tracks = [];
+
+        genes.forEach(gene => {
+
+            let placed = false;
+
+            for (let t = 0; t < tracks.length; t++) {
+
+                const lastGene = tracks[t][tracks[t].length - 1];
+
+                // If NO overlap -> place in same track
+                if (gene.start > lastGene.end) {
+
+                    tracks[t].push(gene);
+                    gene.track = t;
+
+                    placed = true;
+                    break;
+                }
+            }
+
+            // Need new track
+            if (!placed) {
+
+                gene.track = tracks.length;
+                tracks.push([gene]);
+            }
+        });
+
+        return genes;
+    }
+
+    assignTracks(forwardGenes);
+    assignTracks(reverseGenes);
+
+    // -----------------------------
+    // Layout settings
+    // -----------------------------
+    const forwardBaseY = 140;
+    const reverseBaseY = 240;
+
+    const trackSpacing = 28;
+
+    // -----------------------------
+    // Draw genes
+    // -----------------------------
+    function drawGenes(genes, strand) {
+
+        genes.forEach(gene => {
+
+                let start = gene.start;
+                let end = gene.end;
+
+                // flip coordinates
+                if (flipped) {
+                    const flippedPos = flipCoord(start, end, data.genomeLength);
+                    start = flippedPos.start;
+                    end = flippedPos.end;
+                }
+
+                const x1 = xScale(start);
+                const x2 = xScale(end);
+
+                const geneX = Math.min(x1, x2);
+                const geneWidth = Math.max(3, Math.abs(x2 - x1));
+
+                // flip strand interpretation
+                const effectiveStrand = flipped
+                    ? (strand === "+" ? "-" : "+")
+                    : strand;
+
+                const y =
+                    effectiveStrand === "+"
+                        ? forwardBaseY - (gene.track * trackSpacing)
+                        : reverseBaseY + (gene.track * trackSpacing);
+
+                const color =
+                    effectiveStrand === "+"
+                        ? "#4f46e5"
+                        : "#10b981";
+
+                container.append("rect")
+                    .attr("class", "gene")
+                    .attr("x", geneX)
+                    .attr("y", y)
+                    .attr("width", geneWidth)
+                    .attr("height", 18)
+                    .attr("rx", 3)
+                    .attr("fill", color)
+                    .on("mousemove", (event) => {
+
+                        tooltip
+                            .style("opacity", 1)
+                            .html(`
+                                <b>${gene.label}</b><br>
+                                ${gene.start} - ${gene.end}<br>
+                                Strand: ${effectiveStrand}<br>
+                                Protein: ${Math.floor((gene.end - gene.start + 1) / 3)} aa<br>
+                                Track: ${gene.track}
+                            `)
+                            .style("left", (event.pageX + 10) + "px")
+                            .style("top", (event.pageY + 20) + "px");
+                    })
+                    .on("mouseout", () => tooltip.style("opacity", 0));
+            });
+    }
+
+    drawGenes(forwardGenes, "+");
+    drawGenes(reverseGenes, "-");
+}
+
+
+document.getElementById("fileInput")
+    .addEventListener("change", async (event) => {
+
+        const file = event.target.files[0];
+
+        if (!file) return;
+
+        const text = await file.text();
+
+        const parsed = parseGenBank(text);
+
+        lastData = parsed;
+        
+        flipped = false; 
+
+        drawGenome(parsed);
+    });
+
+document.getElementById("flipBtn").onclick = () => {
+    if (!lastData) return;
+    flipped = !flipped;
+    drawGenome(lastData);
+};
+
+
+</script>
+
+</body>
+</html>
