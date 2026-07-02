@@ -6,6 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Simple Phage Genome Viewer</title>
 
+
 <!-- D3.js for scaling genome -->
 <script src="https://d3js.org/d3.v7.min.js"></script>
 
@@ -25,6 +26,10 @@
         background: white;
         overflow: hidden;
         border-radius: 10px;
+        margin-bottom: 10px;
+        margin-top: 10px;
+        width: 100%;
+        max-width: 100%;
     }
 
     .gene-forward {
@@ -69,6 +74,53 @@
         font-size: 11px;
         fill: #333;
     }
+
+
+
+    .selection-rect {
+        fill: none;
+        stroke: red;
+        stroke-width: 1.5;
+        stroke-dasharray: none;
+        pointer-events: none;
+    }
+
+
+
+    #selectionOutput {
+        margin-top: 15px;
+        background: white;
+        border-radius: 10px;
+        padding: 12px;
+        border: 1px solid #ccc;
+
+        display: none;
+        max-width: 100%;
+    }
+
+    #selectionOutput table {
+        border-collapse: collapse;
+        width: auto;
+        table-layout: auto;
+        font-size: 14px;
+    }
+
+    #selectionOutput th,
+    #selectionOutput td {
+        border: 1px solid #ddd;
+        padding: 6px 10px;
+        text-align: center;
+        white-space: nowrap;
+    }
+
+    #selectionOutput th {
+        background: #f0f0f0;
+    }
+
+
+
+
+
 </style>
 </head>
 
@@ -84,13 +136,19 @@ Use mouse wheel to zoom and drag to pan. Press "Flip Genome" button at the botto
 <input type="file" id="fileInput">
 
 <div id="viewer"></div>
+
 <button id="flipBtn">Flip Genome</button>
+<button id="selectBtn">Selection mode: OFF</button>
+
+<div id="selectionOutput"></div>
 
 <div class="tooltip" id="tooltip"></div>
 
 <script>
 
-const width = 2000;
+/*const width = 2000;*/
+
+const width = document.getElementById("viewer").clientWidth || window.innerWidth - 80;
 const height = 400;
 const axisY = 200;
 
@@ -106,6 +164,11 @@ const container = svg.append("g");
 const axisGroup = container.append("g")
     .attr("transform", `translate(0, ${axisY})`);
 
+// This layer is NOT zoomed or panned.
+// It sits above the genome and is used only for the selection rectangle.
+const selectionLayer = svg.append("g")
+    .attr("class", "selection-layer");
+
 
 const tooltip = d3.select("#tooltip");
 
@@ -113,6 +176,18 @@ let genomeLength = 10000;
 let flipped = false;
 let lastData = null;
 let flippedAxis = false;
+
+
+
+let currentZoomTransform = d3.zoomIdentity;
+let drawnGenes = [];
+
+let selectionMode = false;
+let isSelecting = false;
+let selectionStart = null;
+let selectionRect = null;
+
+
 
 const xScale = d3.scaleLinear()
     .domain([0, genomeLength])
@@ -128,6 +203,7 @@ const zoom = d3.zoom()
 svg.call(zoom);
 
 function zoomed(event) {
+    currentZoomTransform = event.transform;
     container.attr("transform", event.transform);
 }
 
@@ -139,6 +215,9 @@ function parseGenBank(text) {
     let sequence = "";
     let inOrigin = false;
     let currentFeature = null;
+
+    let collectingTranslation = false;
+    let cdsCounter = 0;
 
     for (let line of lines) {
 
@@ -152,31 +231,62 @@ function parseGenBank(text) {
             sequence += line.replace(/[^atgcATGC]/g, "");
         }
 
-        if (line.startsWith("     CDS")) {
 
-            if (currentFeature) features.push(currentFeature);
 
-            currentFeature = {
-                type: "CDS",
-                strand: "+",
-                start: 0,
-                end: 0,
-                label: "CDS"
-            };
 
-            const complement = line.includes("complement");
 
-            const match = line.match(/(\d+)\.\.(\d+)/);
+        const featureStart = line.match(/^ {5}(\S+)\s+(.+)/);
 
-            if (match) {
-                currentFeature.start = parseInt(match[1]);
-                currentFeature.end = parseInt(match[2]);
+        if (featureStart) {
+
+            // Any new feature means the previous CDS is finished.
+            if (currentFeature) {
+                features.push(currentFeature);
+                currentFeature = null;
             }
 
-            if (complement) {
-                currentFeature.strand = "-";
+            collectingTranslation = false;
+
+            const featureType = featureStart[1];
+            const location = featureStart[2];
+
+            // Only create viewer features for CDS.
+            if (featureType === "CDS") {
+
+                cdsCounter++;
+
+                currentFeature = {
+                    id: `CDS_${String(cdsCounter).padStart(4, "0")}`,
+                    proteinId: null,
+                    type: "CDS",
+                    strand: "+",
+                    start: 0,
+                    end: 0,
+                    label: "CDS",
+                    protein: ""
+                };
+
+                const complement = location.includes("complement");
+                const match = location.match(/(\d+)\.\.(\d+)/);
+
+                if (match) {
+                    currentFeature.start = parseInt(match[1]);
+                    currentFeature.end = parseInt(match[2]);
+                }
+
+                if (complement) {
+                    currentFeature.strand = "-";
+                }
             }
+
+            continue;
         }
+
+
+
+
+
+
 
         if (currentFeature && line.includes("/gene=")) {
             const gene = line.match(/\/gene=\"([^\"]+)\"/);
@@ -189,6 +299,64 @@ function parseGenBank(text) {
                 currentFeature.label = product[1];
             }
         }
+
+        if (currentFeature && line.includes("/protein_id=")) {
+            const proteinId = line.match(/\/protein_id=\"([^\"]+)\"/);
+            if (proteinId) {
+                currentFeature.proteinId = proteinId[1];
+            }
+        }
+
+
+        // -----------------------------
+        // Parse /translation
+        // -----------------------------
+        if (currentFeature) {
+
+            // start translation
+            if (line.includes('/translation="')) {
+
+                collectingTranslation = true;
+
+                let part = line.split('/translation="')[1];
+
+                // translation ends on same line
+                if (part.includes('"')) {
+
+                    currentFeature.protein =
+                        part.split('"')[0].replace(/\s/g, "");
+
+                    collectingTranslation = false;
+
+                } else {
+
+                    currentFeature.protein +=
+                        part.replace(/\s/g, "");
+                }
+
+                continue;
+            }
+
+            // continuation lines
+            if (collectingTranslation) {
+
+                if (line.includes('"')) {
+
+                    currentFeature.protein +=
+                        line.split('"')[0].replace(/\s/g, "");
+
+                    collectingTranslation = false;
+
+                } else {
+
+                    currentFeature.protein +=
+                        line.replace(/\s/g, "");
+                }
+            }
+        }
+
+
+        
     }
 
     if (currentFeature) features.push(currentFeature);
@@ -197,8 +365,86 @@ function parseGenBank(text) {
 
     return {
         genomeLength,
+        sequence,
         features
     };
+}
+
+function translateCode11(ntSeq) {
+    const table = {
+        TTT:"F", TTC:"F", TTA:"L", TTG:"L",
+        TCT:"S", TCC:"S", TCA:"S", TCG:"S",
+        TAT:"Y", TAC:"Y", TAA:"*", TAG:"*",
+        TGT:"C", TGC:"C", TGA:"*", TGG:"W",
+
+        CTT:"L", CTC:"L", CTA:"L", CTG:"L",
+        CCT:"P", CCC:"P", CCA:"P", CCG:"P",
+        CAT:"H", CAC:"H", CAA:"Q", CAG:"Q",
+        CGT:"R", CGC:"R", CGA:"R", CGG:"R",
+
+        ATT:"I", ATC:"I", ATA:"I", ATG:"M",
+        ACT:"T", ACC:"T", ACA:"T", ACG:"T",
+        AAT:"N", AAC:"N", AAA:"K", AAG:"K",
+        AGT:"S", AGC:"S", AGA:"R", AGG:"R",
+
+        GTT:"V", GTC:"V", GTA:"V", GTG:"V",
+        GCT:"A", GCC:"A", GCA:"A", GCG:"A",
+        GAT:"D", GAC:"D", GAA:"E", GAG:"E",
+        GGT:"G", GGC:"G", GGA:"G", GGG:"G"
+    };
+
+    const seq = ntSeq.toUpperCase().replace(/[^ATGC]/g, "");
+    let protein = "";
+
+    for (let i = 0; i + 2 < seq.length; i += 3) {
+        const codon = seq.slice(i, i + 3);
+        protein += table[codon] || "X";
+    }
+
+    return protein;
+}
+
+
+function highlightMismatches(genbankProtein, fallbackProtein) {
+    const gb = (genbankProtein || "").toUpperCase();
+    const fb = (fallbackProtein || "").toUpperCase();
+
+    const maxLen = Math.max(gb.length, fb.length);
+    let html = "";
+
+    for (let i = 0; i < maxLen; i++) {
+        const aaGB = gb[i] || "-";
+        const aaFB = fb[i] || "-";
+
+        if (aaGB !== aaFB) {
+            html += `<span class="aa-mismatch">${aaGB}</span>`;
+        } else {
+            html += `<span>${aaGB}</span>`;
+        }
+
+
+
+
+        
+    }
+
+    return html;
+}
+
+
+function reverseComplement(seq) {
+    const complement = {
+        A: "T", T: "A",
+        G: "C", C: "G",
+        a: "t", t: "a",
+        g: "c", c: "g"
+    };
+
+    return seq
+        .split("")
+        .reverse()
+        .map(base => complement[base] || base)
+        .join("");
 }
 
 function flipCoord(start, end, length) {
@@ -211,10 +457,16 @@ function flipCoord(start, end, length) {
 
 
 
+
 function drawGenome(data) {
+
+    drawnGenes = [];
 
     container.selectAll(".gene").remove();
     container.selectAll(".gene-label").remove();
+    
+    /*container.selectAll(".gene-arrow").remove();*/
+
 
 
     axisGroup.selectAll("*").remove();
@@ -329,14 +581,24 @@ function drawGenome(data) {
                         ? "#4f46e5"
                         : "#10b981";
 
-                container.append("rect")
-                    .attr("class", "gene")
-                    .attr("x", geneX)
-                    .attr("y", y)
-                    .attr("width", geneWidth)
-                    .attr("height", 18)
-                    .attr("rx", 3)
-                    .attr("fill", color)
+                    const geneRect = container.append("rect")
+                        .attr("class", "gene")
+                        .attr("x", geneX)
+                        .attr("y", y)
+                        .attr("width", geneWidth)
+                        .attr("height", 18)
+                        .attr("rx", 3)
+                        .attr("fill", color);
+
+                    drawnGenes.push({
+                        gene: gene,
+                        x: geneX,
+                        y: y,
+                        width: geneWidth,
+                        height: 18
+                    });
+
+                    geneRect
                     .on("mousemove", (event) => {
 
                         tooltip
@@ -351,6 +613,241 @@ function drawGenome(data) {
                             .style("left", (event.pageX + 10) + "px")
                             .style("top", (event.pageY + 20) + "px");
                     })
+
+
+                    .on("click", (event) => {
+
+                        if (selectionMode) {
+                            event.stopPropagation();
+                            return;
+                        }
+
+                        let geneSeq = data.sequence.slice(gene.start - 1, gene.end);
+
+                        if (gene.strand === "-") {
+                            geneSeq = reverseComplement(geneSeq);
+                        }
+
+                        /*const newWindow = window.open("", "_blank");*/
+
+
+
+                        const fallbackProtein = translateCode11(geneSeq);
+                        const proteinLength = fallbackProtein.replace(/\*/g, "").length;
+
+
+                        const highlightedProtein = gene.protein
+                            ? highlightMismatches(gene.protein, fallbackProtein)
+                            : fallbackProtein;
+
+
+                        const popupWidth = 878;
+                        const popupHeight = 500;
+
+                        const left = window.screenX + 150;
+                        const top = window.screenY + 100;
+
+                        const newWindow = window.open(
+                            "",
+                            "geneSequenceWindow",
+                            `
+                            width=${popupWidth},
+                            height=${popupHeight},
+                            left=${left},
+                            top=${top},
+                            resizable=yes,
+                            scrollbars=yes
+                            `
+                        );
+
+
+
+
+                        newWindow.document.write(`
+                            <html>
+                            <head>
+                                <title>${gene.label}</title>
+                                <style>
+                                    body {
+                                        font-family: monospace;
+                                        padding: 20px;
+                                        background: #fafafa;
+                                        color: #222;
+                                    }
+
+                                    h2 {
+                                        margin-top: 0;
+                                        font-family: Arial, sans-serif;
+                                    }
+
+                                    .ruler {
+                                        font-family: monospace;
+                                        font-size: 13px;
+                                        line-height: 1.5;
+
+                                        white-space: pre;
+                                        color: #b0b0b0;
+
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+
+                                        margin: 0;
+                                        /*border-bottom: 1px solid #aaa;*/
+
+                                        overflow: hidden;
+
+                                        box-sizing: border-box;
+                                    }
+
+                                    .sequence {
+                                        font-family: monospace;
+                                        font-size: 13px;
+                                        line-height: 1.5;
+
+                                        white-space: pre-wrap;
+                                        word-break: break-all;
+                                        overflow-wrap: anywhere;
+
+                                        /*border: 1px solid #ccc;*/
+
+                                        padding: 10px;
+
+                                        max-height: 320px;
+                                        overflow-y: auto;
+
+                                        box-sizing: border-box;
+                                    }
+
+
+                                    .tick1 {
+                                        color: #c8c8c8;
+                                    }
+
+                                    .tick5 {
+                                        color: #8f8f8f;
+                                        font-weight: bold;   
+                                    }
+
+                                    .tick10 {
+                                        color: #c8c8c8;
+                                        font-weight: bold;   
+                                    }
+
+                                    .tick50 {
+                                        color: #c8c8c8;
+                                        font-weight: bold;
+                                    }
+                                    
+                                    .aa-mismatch {
+                                    color: red;
+                                    font-weight: bold;
+                                    }
+
+                                </style>
+                            </head>
+                            <body>
+                                <h2>${gene.label}</h2>
+                                <p><b>Coordinates:</b> ${gene.start} - ${gene.end}</p>
+                                <p><b>Strand:</b> ${gene.strand}</p>
+                                
+                                <h3>Gene</h3>
+                                <p><b>Length:</b> ${gene.end - gene.start + 1} nt</p>
+
+                                <div id="rulertop" class="ruler dna-ruler"></div>
+                                <div id="sequence" class="sequence">${geneSeq.toUpperCase()}</div>
+                                <div id="rulerbottom" class="ruler dna-ruler"></div>
+
+                                
+                                <h3>Protein</h3>
+                                <p><b>Length:</b> ${proteinLength} aa</p>
+                                <p><b>GenBank vs adhoc (GenCode11) translation:</b> mismatches highlighted in red.</p>
+
+
+                                <div class="ruler protein-ruler"></div>
+                                <div id="proteinSequence" class="sequence">${highlightedProtein}</div>
+                                <div class="ruler protein-ruler"></div>
+
+
+                                <script>
+                                function getCharWidth(element) {
+                                    const test = document.createElement("span");
+
+                                    test.textContent = "MMMMMMMMMM";
+                                    test.style.font = getComputedStyle(element).font;
+                                    test.style.visibility = "hidden";
+                                    test.style.position = "absolute";
+
+                                    document.body.appendChild(test);
+
+                                    const width = test.getBoundingClientRect().width / 10;
+
+                                    test.remove();
+
+                                    return width;
+                                }
+
+                                function drawRulerFor(sequenceID, rulerSelector) {
+                                    const sequence = document.getElementById(sequenceID);
+                                    
+                                    const rulers = document.querySelectorAll(rulerSelector);
+
+                                    if (!sequence || rulers.length === 0) return;
+
+                                    const style = getComputedStyle(sequence);
+                                    const paddingLeft = parseFloat(style.paddingLeft);
+                                    const paddingRight = parseFloat(style.paddingRight);
+
+                                    
+                                    const usableWidth = sequence.clientWidth - paddingLeft - paddingRight;
+
+
+
+                                    const charWidth = getCharWidth(sequence);
+
+                                    if (!charWidth || usableWidth <= 0) return;
+
+                                    const charsPerLine = Math.floor(usableWidth / charWidth);
+
+                                    let rulerHTML = "";
+
+                                    for (let i = 1; i <= charsPerLine; i++) {
+                                        if (i % 50 === 0) {
+                                            rulerHTML += '<span class="tick50">|</span>';
+                                        } else if (i % 10 === 0) {
+                                            rulerHTML += '<span class="tick10">&apos;</span>';
+                                        } else if (i % 5 === 0) {
+                                            rulerHTML += '<span class="tick5">.</span>';
+                                        } else {
+                                            rulerHTML += '<span class="tick1">.</span>';
+                                        }
+                                    }
+
+                                    rulers.forEach(r => {
+                                        r.innerHTML = rulerHTML;
+                                    });
+                                }
+
+                                function drawRulers() {
+                                    drawRulerFor("sequence", ".dna-ruler");
+                                    drawRulerFor("proteinSequence", ".protein-ruler");
+                                }
+
+                                window.addEventListener("resize", drawRulers);
+                                window.addEventListener("load", drawRulers);
+
+                                const observer = new ResizeObserver(drawRulers);
+                                observer.observe(document.getElementById("sequence"));
+                                observer.observe(document.getElementById("proteinSequence"));
+
+                                <\/script>
+
+                                
+                            </body>
+                            </html>
+                        `);
+
+                        newWindow.document.close();
+                    })
                     .on("mouseout", () => tooltip.style("opacity", 0));
             });
     }
@@ -358,6 +855,188 @@ function drawGenome(data) {
     drawGenes(forwardGenes, "+");
     drawGenes(reverseGenes, "-");
 }
+
+
+function normalizeRect(x1, y1, x2, y2) {
+    return {
+        x: Math.min(x1, x2),
+        y: Math.min(y1, y2),
+        width: Math.abs(x2 - x1),
+        height: Math.abs(y2 - y1)
+    };
+}
+
+function isGeneFullyCoveredBySelection(geneBox, selectionBox) {
+    return (
+        geneBox.x >= selectionBox.x &&
+        geneBox.y >= selectionBox.y &&
+        geneBox.x + geneBox.width <= selectionBox.x + selectionBox.width &&
+        geneBox.y + geneBox.height <= selectionBox.y + selectionBox.height
+    );
+}
+
+function getProteinLength(gene) {
+    if (gene.protein && gene.protein.length > 0) {
+        return gene.protein.replace(/\*/g, "").length;
+    }
+
+    return Math.floor((gene.end - gene.start + 1) / 3);
+}
+
+function renderSelectionTable(selectedGenes) {
+    const output = document.getElementById("selectionOutput");
+
+    // Make the output area visible only after the first selection
+    output.style.display = "block";
+
+    if (!selectedGenes.length) {
+        output.innerHTML = "<b>Selected genes:</b> none";
+        return;
+    }
+
+    let html = `
+        <b>Selected genes:</b> ${selectedGenes.length}
+        <br><br>
+        <table>
+            <thead>
+                <tr>
+                    <th>Sequence ID</th>
+                    <th>Protein ID</th>
+                    <th>Label</th>
+                    <th>Coordinates</th>
+                    <th>Strand</th>
+                    <th>Protein length</th>
+                </tr>
+            </thead>
+            <tbody>
+    `;
+
+    selectedGenes.forEach(gene => {
+        html += `
+            <tr>
+                <td>${gene.id}</td>
+                <td>${gene.proteinId || "no CDS"}</td>
+                <td>${gene.label || ""}</td>
+                <td>${gene.start} - ${gene.end}</td>
+                <td>${gene.strand}</td>
+                <td>${getProteinLength(gene)} aa</td>
+            </tr>
+        `;
+    });
+
+    html += `
+            </tbody>
+        </table>
+    `;
+
+    output.innerHTML = html;
+}
+
+
+function clearSelectionDisplay() {
+    isSelecting = false;
+    selectionStart = null;
+    selectionRect = null;
+
+    selectionLayer.selectAll(".selection-rect").remove();
+
+    const output = document.getElementById("selectionOutput");
+    output.style.display = "none";
+    output.innerHTML = "";
+}
+
+
+function resetSelectionState() {
+    clearSelectionDisplay();
+
+    selectionMode = false;
+    document.getElementById("selectBtn").textContent = "Selection mode: OFF";
+
+    svg.call(zoom);
+
+    currentZoomTransform = d3.zoomIdentity;
+    svg.call(zoom.transform, d3.zoomIdentity);
+}
+
+
+svg.on("mousedown.selection", (event) => {
+
+    if (!selectionMode || !lastData) return;
+
+    event.preventDefault();
+
+    isSelecting = true;
+
+    const [x, y] = d3.pointer(event, svg.node());
+
+    selectionStart = { x, y };
+
+    selectionLayer.selectAll(".selection-rect").remove();
+
+    selectionRect = selectionLayer.append("rect")
+        .attr("class", "selection-rect")
+        .attr("x", x)
+        .attr("y", y)
+        .attr("width", 0)
+        .attr("height", 0);
+});
+
+svg.on("mousemove.selection", (event) => {
+
+    if (!selectionMode || !isSelecting || !selectionRect) return;
+
+    const [x, y] = d3.pointer(event, svg.node());
+
+    const box = normalizeRect(
+        selectionStart.x,
+        selectionStart.y,
+        x,
+        y
+    );
+
+    selectionRect
+        .attr("x", box.x)
+        .attr("y", box.y)
+        .attr("width", box.width)
+        .attr("height", box.height);
+});
+
+svg.on("mouseup.selection", (event) => {
+
+    if (!selectionMode || !isSelecting || !selectionRect) return;
+
+    isSelecting = false;
+
+    const [x, y] = d3.pointer(event, svg.node());
+
+    const selectionBox = normalizeRect(
+        selectionStart.x,
+        selectionStart.y,
+        x,
+        y
+    );
+
+    const selectedGenes = [];
+
+    drawnGenes.forEach(item => {
+
+        // Convert gene coordinates from genome-container space
+        // into visible SVG screen space after zoom/pan.
+        const visibleGeneBox = {
+            x: currentZoomTransform.applyX(item.x),
+            y: currentZoomTransform.applyY(item.y),
+            width: item.width * currentZoomTransform.k,
+            height: item.height * currentZoomTransform.k
+        };
+
+        if (isGeneFullyCoveredBySelection(visibleGeneBox, selectionBox)) {
+            selectedGenes.push(item.gene);
+        }
+    });
+
+    renderSelectionTable(selectedGenes);
+});
+
 
 
 document.getElementById("fileInput")
@@ -373,7 +1052,9 @@ document.getElementById("fileInput")
 
         lastData = parsed;
         
-        flipped = false; 
+        flipped = false;
+        
+        resetSelectionState();
 
         drawGenome(parsed);
     });
@@ -383,6 +1064,36 @@ document.getElementById("flipBtn").onclick = () => {
     flipped = !flipped;
     drawGenome(lastData);
 };
+
+window.addEventListener("resize", () => {
+    if (!lastData) return;
+
+    const newWidth = document.getElementById("viewer").clientWidth;
+
+    svg.attr("width", newWidth);
+
+    xScale.range([50, newWidth - 50]);
+
+    drawGenome(lastData);
+});
+
+
+document.getElementById("selectBtn").onclick = () => {
+    selectionMode = !selectionMode;
+
+    const btn = document.getElementById("selectBtn");
+
+    if (selectionMode) {
+        btn.textContent = "Selection mode: ON";
+        svg.on(".zoom", null);
+    } else {
+        btn.textContent = "Selection mode: OFF";
+        clearSelectionDisplay();
+        svg.call(zoom);
+    }
+};
+
+
 
 
 </script>
